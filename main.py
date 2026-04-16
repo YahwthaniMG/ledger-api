@@ -1,17 +1,36 @@
 import os
 import re
+import time
+import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+QUERY_TIMEOUT_MS = 5000
+
+# Logger para queries rechazadas
+logging.basicConfig(
+    filename="rejected_queries.log",
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("ledger.security")
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="Ledger API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,7 +70,11 @@ def validate_query(sql: str):
 
 
 def get_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        options=f"-c statement_timeout={QUERY_TIMEOUT_MS}",
+    )
 
 
 class QueryRequest(BaseModel):
@@ -59,7 +82,8 @@ class QueryRequest(BaseModel):
 
 
 @app.get("/health")
-def health():
+@limiter.limit("30/minute")
+def health(request: Request):
     try:
         conn = get_connection()
         conn.close()
@@ -69,7 +93,8 @@ def health():
 
 
 @app.get("/tables")
-def tables():
+@limiter.limit("30/minute")
+def tables(request: Request):
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -89,18 +114,25 @@ def tables():
 
 
 @app.post("/query")
-def execute_query(request: QueryRequest):
-    is_valid, message = validate_query(request.sql)
+@limiter.limit("30/minute")
+def execute_query(request: Request, body: QueryRequest):
+    is_valid, message = validate_query(body.sql)
     if not is_valid:
+        logger.warning(
+            "REJECTED | ip=%s | reason=%s | sql=%s",
+            get_remote_address(request),
+            message,
+            body.sql[:120],
+        )
         return {"status": "error", "message": message, "columns": [], "rows": []}
 
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(request.sql)
+        cursor.execute(body.sql)
 
-        if request.sql.strip().upper().startswith("SELECT"):
+        if body.sql.strip().upper().startswith("SELECT"):
             rows = cursor.fetchall()
             columns = [desc[0] for desc in cursor.description]
             return {
@@ -118,6 +150,16 @@ def execute_query(request: QueryRequest):
                 "rows": [],
             }
 
+    except psycopg2.errors.QueryCanceled:
+        logger.warning(
+            "TIMEOUT | ip=%s | sql=%s", get_remote_address(request), body.sql[:120]
+        )
+        return {
+            "status": "error",
+            "message": f"Query cancelada: excedio el limite de {QUERY_TIMEOUT_MS}ms",
+            "columns": [],
+            "rows": [],
+        }
     except psycopg2.Error as e:
         return {
             "status": "error",
