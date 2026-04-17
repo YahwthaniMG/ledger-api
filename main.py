@@ -19,9 +19,9 @@ QUERY_TIMEOUT_MS = 5000
 
 # Logger para queries rechazadas
 logging.basicConfig(
-    filename="rejected_queries.log",
     level=logging.WARNING,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("ledger.security")
 
@@ -130,6 +130,7 @@ def execute_query(request: Request, body: QueryRequest):
     try:
         conn = get_connection()
         cursor = conn.cursor()
+        cursor.execute(f"SET statement_timeout = {QUERY_TIMEOUT_MS}")
         cursor.execute(body.sql)
 
         if body.sql.strip().upper().startswith("SELECT"):
